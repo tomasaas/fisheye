@@ -1,84 +1,98 @@
 #include <WiFi.h>
-#include <WiFiClient.h>
-#include <WiFiAP.h>
+#include <WebServer.h>
+#include <esp_camera.h>
 
-// Set these to your desired credentials.
 const char *ssid = "fisheye_AP";
-
-WiFiServer server(80);
-
+WebServer server(80);
 
 void setup() {
-
-    pinMode(LED_BUILTIN, OUTPUT);
-
     Serial.begin(115200);
-    Serial.println();
-    Serial.println("Configuring access point...");
 
-    if(!WiFi.softAP(ssid)) {
-        log_e("Soft AP creation failed.");
-        while(1);
+    // Camera pins for the XIAO ESP32S3 Sense expansion board.
+    camera_config_t config = {};
+    config.pin_pwdn = -1;
+    config.pin_reset = -1;
+    config.pin_xclk = 10;
+    config.pin_sccb_sda = 40;
+    config.pin_sccb_scl = 39;
+    config.pin_d0 = 15;
+    config.pin_d1 = 17;
+    config.pin_d2 = 18;
+    config.pin_d3 = 16;
+    config.pin_d4 = 14;
+    config.pin_d5 = 12;
+    config.pin_d6 = 11;
+    config.pin_d7 = 48;
+    config.pin_vsync = 38;
+    config.pin_href = 47;
+    config.pin_pclk = 13;
+    config.xclk_freq_hz = 20000000;
+    config.ledc_timer = LEDC_TIMER_0;
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size = FRAMESIZE_VGA; // 640 x 480
+    config.jpeg_quality = 12;
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+
+    esp_err_t error = esp_camera_init(&config);
+    if (error != ESP_OK) {
+        Serial.printf("Camera init failed: 0x%x\n", error);
+        while (true) delay(1000);
     }
 
     IPAddress local_ip(10, 10, 10, 10);
-    IPAddress gateway(10, 10, 10, 10);
     IPAddress subnet(255, 255, 255, 0);
-    WiFi.softAPConfig(local_ip, gateway, subnet);
+    if (!WiFi.softAPConfig(local_ip, local_ip, subnet) || !WiFi.softAP(ssid)) {
+        Serial.println("Access point setup failed.");
+        while (true) delay(1000);
+    }
 
-    IPAddress myIP = WiFi.softAPIP();
-    Serial.println(myIP);
+    server.on("/", HTTP_GET, []() {
+        server.send(200, "text/html",
+            "<!doctype html><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<title>Fisheye</title><img src=\"/stream\" style=\"max-width:100%\" alt=\"Live camera\">");
+    });
+
+    // Send JPEG frames continuously to one viewer at a time.
+    server.on("/stream", HTTP_GET, []() {
+        WiFiClient client = server.client();
+        const char response[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n\r\n";
+        if (client.print(response) != sizeof(response) - 1) {
+            client.stop();
+            return;
+        }
+
+        while (client.connected()) {
+            camera_fb_t *frame = esp_camera_fb_get();
+            if (!frame) {
+                Serial.println("Camera capture failed.");
+                break;
+            }
+
+            char header[96];
+            int length = snprintf(header, sizeof(header),
+                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                (unsigned int)frame->len);
+            bool sent = client.write((const uint8_t *)header, length) == (size_t)length
+                && client.write(frame->buf, frame->len) == frame->len
+                && client.print("\r\n") == 2;
+            esp_camera_fb_return(frame);
+            if (!sent) break;
+            delay(1);
+        }
+        client.stop();
+    });
+
     server.begin();
-    Serial.println("Server started");
+    Serial.println("Camera ready: http://10.10.10.10/");
 }
 
 void loop() {
-  WiFiClient client = server.available();   // listen for incoming clients
-
-  if (client) {                             // if you get a client,
-    Serial.println("New Client.");           // print a message out the serial port
-    String currentLine = "";                // make a String to hold incoming data from the client
-    while (client.connected()) {            // loop while the client's connected
-      if (client.available()) {             // if there's bytes to read from the client,
-        char c = client.read();             // read a byte, then
-        Serial.write(c);                    // print it out the serial monitor
-        if (c == '\n') {                    // if the byte is a newline character
-
-          // if the current line is blank, you got two newline characters in a row.
-          // that's the end of the client HTTP request, so send a response:
-          if (currentLine.length() == 0) {
-            // HTTP headers always start with a response code (e.g. HTTP/1.1 200 OK)
-            // and a content-type so the client knows what's coming, then a blank line:
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-type:text/html");
-            client.println();
-
-            // the content of the HTTP response follows the header:
-            client.print("Click <a href=\"/H\">here</a> to turn ON the LED.<br>");
-            client.print("Click <a href=\"/L\">here</a> to turn OFF the LED.<br>");
-
-            // The HTTP response ends with another blank line:
-            client.println();
-            // break out of the while loop:
-            break;
-          } else {    // if you got a newline, then clear currentLine:
-            currentLine = "";
-          }
-        } else if (c != '\r') {  // if you got anything else but a carriage return character,
-          currentLine += c;      // add it to the end of the currentLine
-        }
-
-        // Check to see if the client request was "GET /H" or "GET /L":
-        if (currentLine.endsWith("GET /H")) {
-          digitalWrite(LED_BUILTIN, HIGH);               // GET /H turns the LED on
-        }
-        if (currentLine.endsWith("GET /L")) {
-          digitalWrite(LED_BUILTIN, LOW);                // GET /L turns the LED off
-        }
-      }
-    }
-    // close the connection:
-    client.stop();
-    Serial.println("Client Disconnected.");
-  }
+    server.handleClient();
 }
